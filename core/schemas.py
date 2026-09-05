@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 from config import QUESTION_TYPES, ROUTE_LABELS
@@ -40,19 +39,30 @@ def validate_result(payload: Any, question: str, mode: str) -> dict[str, Any]:
         raise ValueError("模型输出的问题类型不在约定范围内")
 
     for key in ("已识别信息", "标准化信息"):
-        source = payload.get(key, {})
+        if key not in payload:
+            raise ValueError(f"模型输出缺少 {key}")
+        source = payload[key]
         if not isinstance(source, dict):
             raise ValueError(f"{key} 必须是对象")
         for field in ENTITY_FIELDS:
-            values = source.get(field, [])
+            if field not in source:
+                raise ValueError(f"模型输出缺少 {key}.{field}")
+            values = source[field]
             if not isinstance(values, list):
                 raise ValueError(f"{key}.{field} 必须是数组")
-            result[key][field] = [item for item in values if isinstance(item, dict)]
+            if not all(isinstance(item, dict) for item in values):
+                raise ValueError(f"{key}.{field} 的条目必须是对象")
+            result[key][field] = values
 
-    missing = payload.get("缺失信息", [])
-    result["缺失信息"] = [str(item) for item in missing] if isinstance(missing, list) else []
+    missing = payload.get("缺失信息")
+    if not isinstance(missing, list) or not all(isinstance(item, str) for item in missing):
+        raise ValueError("缺失信息必须是字符串数组")
+    result["缺失信息"] = missing
     result["信息完整性"] = str(payload.get("信息完整性", "信息不足"))
-    result["澄清提示"] = str(payload.get("澄清提示", ""))
+    clarification = payload.get("澄清提示")
+    if not isinstance(clarification, str):
+        raise ValueError("澄清提示必须是字符串")
+    result["澄清提示"] = clarification
 
     route = payload.get("处理建议", {})
     if not isinstance(route, dict) or route.get("标签") not in ROUTE_LABELS:
@@ -65,4 +75,3 @@ def validate_result(payload: Any, question: str, mode: str) -> dict[str, Any]:
     except (TypeError, ValueError):
         result["置信度"] = 0.5
     return result
-

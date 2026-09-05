@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Literal
 
+from config import PROCESSING_MODES
 from core.analyzer import analyze_with_rules
 from core.llm_client import analyze_with_llm
 
@@ -13,6 +14,8 @@ def analyze(question: str, mode: Mode = "hybrid") -> dict:
     """Single integration point for the UI and evaluation modules."""
     if not question or not question.strip():
         raise ValueError("请输入问题")
+    if mode not in PROCESSING_MODES:
+        raise ValueError(f"不支持的处理模式：{mode}；可选值为 {', '.join(PROCESSING_MODES)}")
     started = time.perf_counter()
     rules = analyze_with_rules(question.strip())
     if mode == "rules":
@@ -45,4 +48,3 @@ if __name__ == "__main__":
     import json
     import sys
     print(json.dumps(analyze(" ".join(sys.argv[1:]) or "轴箱有点响，应该怎么办？"), ensure_ascii=False, indent=2))
-

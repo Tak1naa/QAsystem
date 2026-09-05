@@ -26,3 +26,4 @@ QUESTION_TYPES = [
     "非动车检修问题",
 ]
 ROUTE_LABELS = ["RAG", "KG", "CLARIFY", "OUT_OF_SCOPE"]
+PROCESSING_MODES = ["rules", "llm", "hybrid"]
