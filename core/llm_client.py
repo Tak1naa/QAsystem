@@ -58,6 +58,8 @@ def analyze_with_llm(question: str) -> tuple[dict[str, Any], float]:
             )
             with urlopen(request, timeout=LLM_TIMEOUT_SECONDS) as response:
                 response_payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(response_payload, dict):
+                raise ValueError("API 响应不是 JSON 对象")
             choices = response_payload.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise ValueError("API 响应缺少 choices")
@@ -73,4 +75,4 @@ def analyze_with_llm(question: str) -> tuple[dict[str, Any], float]:
         except (HTTPError, URLError, OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             last_error = exc
     detail = type(last_error).__name__ if last_error else "UnknownError"
-    raise RuntimeError(f"LLM 调用或结果校验失败（已重试 2 次）：{detail}")
+    raise RuntimeError(f"LLM 调用或结果校验失败（共尝试 2 次）：{detail}")

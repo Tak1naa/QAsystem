@@ -50,8 +50,11 @@ def validate_result(payload: Any, question: str, mode: str) -> dict[str, Any]:
             values = source[field]
             if not isinstance(values, list):
                 raise ValueError(f"{key}.{field} 必须是数组")
-            if not all(isinstance(item, dict) for item in values):
-                raise ValueError(f"{key}.{field} 的条目必须是对象")
+            if not all(isinstance(item, dict) and all(
+                isinstance(item.get(name), str) and item[name].strip()
+                for name in ("原始词", "标准词")
+            ) for item in values):
+                raise ValueError(f"{key}.{field} 的条目必须包含非空原始词和标准词")
             result[key][field] = values
 
     missing = payload.get("缺失信息")

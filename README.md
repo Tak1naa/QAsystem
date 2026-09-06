@@ -39,7 +39,7 @@ python -m pytest tests -q
 
 ## 团队约定
 
-完整接口、分工和提交规范见 [docs/TEAM_PROTOCOL.md](docs/TEAM_PROTOCOL.md)。
+完整接口、分工和提交规范见 [doc/TEAM_PROTOCOL.md](doc/TEAM_PROTOCOL.md)。
 
 ## 组长首次发布
 

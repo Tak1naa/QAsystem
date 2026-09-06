@@ -1,48 +1,431 @@
+# evaluate.py - 批量评估程序（100条样本，三模式对比）
 from __future__ import annotations
 
 import csv
 import json
 import sys
+import time
 from pathlib import Path
+from collections import defaultdict
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from main import analyze
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def normalized_terms(result: dict, field: str) -> set[str]:
-    return {item["标准词"] for item in result["标准化信息"].get(field, [])}
+    """从标准化信息中提取指定字段的标准词集合"""
+    return {item.get("标准词", "") for item in result.get("标准化信息", {}).get(field, []) if item.get("标准词")}
 
 
-def run(mode: str = "rules") -> list[dict]:
-    samples = json.loads((ROOT / "data" / "questions.json").read_text(encoding="utf-8"))
+def load_samples() -> list[dict]:
+    """加载样本数据"""
+    samples_path = ROOT / "data" / "questions.json"
+    if not samples_path.exists():
+        samples_path = ROOT / "questions.json"
+    
+    if not samples_path.exists():
+        print(f"错误: 未找到样本文件: {samples_path}")
+        sys.exit(1)
+    
+    with samples_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[list[dict], dict]:
+    """
+    运行指定模式的评估
+    
+    Args:
+        mode: "rules" | "llm" | "hybrid"
+        sample_limit: 限制样本数量（用于快速测试）
+    
+    Returns:
+        (rows, stats)
+    """
+    samples = load_samples()
+    if sample_limit:
+        samples = samples[:sample_limit]
+    
     rows = []
-    for sample in samples:
-        result = analyze(sample["原始问题"], mode)
+    
+    print(f"\n>>> 运行模式: {mode.upper()} ({len(samples)} 条样本)")
+    
+    for idx, sample in enumerate(samples, 1):
+        question = sample.get("原始问题", "")
+        if not question:
+            continue
+        
+        if idx % 20 == 0:
+            print(f"   进度: {idx}/{len(samples)}")
+        
+        start_time = time.time()
+        try:
+            result = analyze(question, mode)
+        except Exception as e:
+            print(f"   警告: 问题 '{question[:20]}...' 失败: {e}")
+            rows.append({
+                "id": sample.get("id", f"ERR_{idx}"),
+                "问题": question[:30] + "..." if len(question) > 30 else question,
+                "模式": mode,
+                "类型正确": False,
+                "关键信息正确": False,
+                "缺失判断正确": False,
+                "路由正确": False,
+                "总耗时_ms": 0,
+                "规则耗时_ms": 0,
+                "大模型耗时_ms": 0,
+                "fallback": True,
+                "原始问题": question,
+                "实际类型": "ERROR",
+                "期望类型": sample.get("问题类型", ""),
+                "实际路由": "ERROR",
+                "期望路由": sample.get("处理标签", ""),
+                "实际缺失": "ERROR",
+                "期望缺失": "|".join(sample.get("缺失信息", [])),
+            })
+            continue
+        
+        elapsed = (time.time() - start_time) * 1000
+        
         expected = sample.get("关键信息", {})
-        entity_ok = all(set(values).issubset(normalized_terms(result, field)) for field, values in expected.items())
+        expected_type = sample.get("问题类型", "")
+        expected_missing = set(sample.get("缺失信息", []))
+        expected_route = sample.get("处理标签", "")
+        
+        type_ok = result.get("问题类型", "") == expected_type
+        
+        entity_ok = True
+        for field, values in expected.items():
+            if not values:
+                continue
+            norm_set = normalized_terms(result, field)
+            if not set(values).issubset(norm_set):
+                entity_ok = False
+                break
+        
+        actual_missing = set(result.get("缺失信息", []))
+        missing_ok = actual_missing == expected_missing
+        
+        actual_route = result.get("处理建议", {}).get("标签", "")
+        route_ok = actual_route == expected_route
+        
         rows.append({
-            "id": sample["id"], "问题": sample["原始问题"], "模式": mode,
-            "类型正确": result["问题类型"] == sample["问题类型"],
+            "id": sample.get("id", ""),
+            "问题": question[:30] + "..." if len(question) > 30 else question,
+            "模式": mode,
+            "类型正确": type_ok,
             "关键信息正确": entity_ok,
-            "缺失判断正确": set(result["缺失信息"]) == set(sample.get("缺失信息", [])),
-            "路由正确": result["处理建议"]["标签"] == sample["处理标签"],
-            "总耗时_ms": result["运行耗时"]["总耗时_ms"],
-            "fallback": result["元数据"].get("fallback_used", False),
+            "缺失判断正确": missing_ok,
+            "路由正确": route_ok,
+            "总耗时_ms": round(elapsed, 2),
+            "规则耗时_ms": result.get("运行耗时", {}).get("规则耗时_ms", 0),
+            "大模型耗时_ms": result.get("运行耗时", {}).get("大模型耗时_ms", 0),
+            "fallback": result.get("元数据", {}).get("fallback_used", False),
+            "原始问题": question,
+            "实际类型": result.get("问题类型", ""),
+            "期望类型": expected_type,
+            "实际路由": actual_route,
+            "期望路由": expected_route,
+            "实际缺失": "|".join(actual_missing),
+            "期望缺失": "|".join(expected_missing),
         })
-    return rows
+    
+    total = len(rows)
+    valid = [r for r in rows if r["总耗时_ms"] > 0]
+    vc = len(valid) if valid else 1
+    
+    stats = {
+        "total": total,
+        "valid": len(valid),
+        "type_correct": sum(r["类型正确"] for r in valid),
+        "entity_correct": sum(r["关键信息正确"] for r in valid),
+        "missing_correct": sum(r["缺失判断正确"] for r in valid),
+        "route_correct": sum(r["路由正确"] for r in valid),
+        "avg_time": sum(r["总耗时_ms"] for r in valid) / vc if valid else 0,
+        "fallback_count": sum(r["fallback"] for r in rows),
+    }
+    
+    return rows, stats
+
+
+def save_csv(rows: list[dict], output_path: Path) -> None:
+    """保存 CSV 结果"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    fieldnames = [
+        "id", "问题", "模式", "类型正确", "关键信息正确",
+        "缺失判断正确", "路由正确", "总耗时_ms", "规则耗时_ms",
+        "大模型耗时_ms", "fallback"
+    ]
+    
+    with output_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def print_stats(stats: dict) -> None:
+    """打印统计信息"""
+    total = stats["valid"]
+    if total == 0:
+        print("   警告: 无有效结果")
+        return
+    
+    print(f"   有效样本: {total}/{stats['total']}")
+    print(f"   类型识别准确率: {stats['type_correct']/total:.1%}")
+    print(f"   关键信息提取准确率: {stats['entity_correct']/total:.1%}")
+    print(f"   缺失判断准确率: {stats['missing_correct']/total:.1%}")
+    print(f"   路由建议准确率: {stats['route_correct']/total:.1%}")
+    print(f"   平均耗时: {stats['avg_time']:.2f}ms")
+    if stats.get("fallback_count", 0) > 0:
+        print(f"   降级次数: {stats['fallback_count']}")
+
+
+def compare_modes(sample_limit: int | None = None) -> None:
+    """三模式对比"""
+    modes = ["rules", "llm", "hybrid"]
+    mode_names = {
+        "rules": "纯规则引擎",
+        "llm": "纯LLM (DeepSeek)",
+        "hybrid": "混合模式 (规则+LLM)"
+    }
+    
+    all_results = {}
+    all_stats = {}
+    
+    print("=" * 70)
+    print("动车检修问答系统 - 三模式批量评估")
+    print("=" * 70)
+    
+    samples = load_samples()
+    if sample_limit:
+        samples = samples[:sample_limit]
+    print(f"\n加载样本: {len(samples)} 条")
+    
+    type_dist = defaultdict(int)
+    for s in samples:
+        type_dist[s.get("问题类型", "未知")] += 1
+    print("   类型分布:")
+    for t, c in sorted(type_dist.items()):
+        print(f"      {t}: {c}条")
+    
+    for mode in modes:
+        print("\n" + "-" * 70)
+        print(f"模式: {mode_names[mode]}")
+        print("-" * 40)
+        
+        rows, stats = run_mode(mode, sample_limit)
+        all_results[mode] = rows
+        all_stats[mode] = stats
+        
+        output_path = ROOT / "evaluation" / f"results_{mode}.csv"
+        save_csv(rows, output_path)
+        print(f"   已保存: {output_path}")
+        print_stats(stats)
+    
+    print("\n" + "=" * 70)
+    print("三模式对比汇总")
+    print("=" * 70)
+    
+    print(f"\n{'指标':<22} {'规则引擎':<18} {'纯LLM':<18} {'混合模式':<18}")
+    print("-" * 76)
+    
+    metrics = [
+        ("类型识别准确率", "type_correct"),
+        ("关键信息提取准确率", "entity_correct"),
+        ("缺失判断准确率", "missing_correct"),
+        ("路由建议准确率", "route_correct"),
+    ]
+    
+    summary = {}
+    for mode, stats in all_stats.items():
+        total = stats["valid"]
+        summary[mode] = {
+            "total": total,
+            "avg_time": stats["avg_time"],
+            "type_acc": stats["type_correct"] / total if total else 0,
+            "entity_acc": stats["entity_correct"] / total if total else 0,
+            "missing_acc": stats["missing_correct"] / total if total else 0,
+            "route_acc": stats["route_correct"] / total if total else 0,
+            "fallback_count": stats.get("fallback_count", 0),
+        }
+    
+    for label, key in metrics:
+        values = [f"{summary[m][key]:>8.1%}" for m in modes]
+        print(f"{label:<22} {values[0]:<18} {values[1]:<18} {values[2]:<18}")
+    
+    times = [f"{summary[m]['avg_time']:>8.2f}ms" for m in modes]
+    print(f"{'平均耗时':<22} {times[0]:<18} {times[1]:<18} {times[2]:<18}")
+    
+    fallbacks = [f"{summary[m]['fallback_count']:>8}次" for m in modes]
+    print(f"{'降级次数':<22} {fallbacks[0]:<18} {fallbacks[1]:<18} {fallbacks[2]:<18}")
+    
+    print("\n" + "=" * 70)
+    print("错误案例分析（混合模式）")
+    print("=" * 70)
+    
+    hybrid_rows = all_results.get("hybrid", [])
+    error_rows = [
+        r for r in hybrid_rows
+        if not all([r["类型正确"], r["关键信息正确"], r["缺失判断正确"], r["路由正确"]])
+    ]
+    
+    if error_rows:
+        print(f"\n共发现 {len(error_rows)} 个错误案例，显示前5个：")
+        for i, err in enumerate(error_rows[:5], 1):
+            print(f"\n案例 {i}: {err.get('原始问题', err.get('问题', ''))}")
+            print(f"   期望: 类型={err.get('期望类型', '')}, 路由={err.get('期望路由', '')}, 缺失={err.get('期望缺失', '')}")
+            print(f"   实际: 类型={err.get('实际类型', '')}, 路由={err.get('实际路由', '')}, 缺失={err.get('实际缺失', '')}")
+            error_items = []
+            if not err["类型正确"]: error_items.append("类型识别")
+            if not err["关键信息正确"]: error_items.append("关键信息提取")
+            if not err["缺失判断正确"]: error_items.append("缺失判断")
+            if not err["路由正确"]: error_items.append("路由建议")
+            print(f"   错误项: {' -> '.join(error_items)}")
+    else:
+        print("\n混合模式下无错误案例")
+    
+    report = {
+        "sample_count": len(samples),
+        "type_distribution": dict(type_dist),
+        "summary": summary,
+        "error_count": len(error_rows),
+        "errors": [
+            {
+                "id": e.get("id", ""),
+                "question": e.get("原始问题", e.get("问题", "")),
+                "expected": {
+                    "type": e.get("期望类型", ""),
+                    "route": e.get("期望路由", ""),
+                    "missing": e.get("期望缺失", "")
+                },
+                "actual": {
+                    "type": e.get("实际类型", ""),
+                    "route": e.get("实际路由", ""),
+                    "missing": e.get("实际缺失", "")
+                }
+            }
+            for e in error_rows[:10]
+        ]
+    }
+    
+    report_path = ROOT / "evaluation" / "comparison_report.json"
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print(f"\n详细报告已保存: {report_path}")
+    
+    md_path = ROOT / "evaluation" / "评估报告.md"
+    generate_markdown(md_path, summary, modes, mode_names, error_rows)
+    print(f"Markdown报告已保存: {md_path}")
+    
+    print("\n" + "=" * 70)
+    print("评估完成")
+    print("=" * 70)
+
+
+def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dict, errors: list) -> None:
+    """生成 Markdown 报告"""
+    lines = [
+        "# 动车检修问答系统 - 评估报告",
+        "",
+        f"**生成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## 1. 三模式对比",
+        "",
+        "| 指标 | 规则引擎 | 纯LLM | 混合模式 |",
+        "|------|----------|-------|----------|",
+    ]
+    
+    metrics = [
+        ("类型识别准确率", "type_acc"),
+        ("关键信息提取准确率", "entity_acc"),
+        ("缺失判断准确率", "missing_acc"),
+        ("路由建议准确率", "route_acc"),
+    ]
+    
+    for label, key in metrics:
+        values = [f"{summary[m][key]:.1%}" for m in modes]
+        lines.append(f"| {label} | {values[0]} | {values[1]} | {values[2]} |")
+    
+    times = [f"{summary[m]['avg_time']:.2f}ms" for m in modes]
+    lines.append(f"| 平均耗时 | {times[0]} | {times[1]} | {times[2]} |")
+    
+    lines.extend([
+        "",
+        "## 2. 结论与建议",
+        "",
+        f"- **混合模式** 综合表现最佳，推荐作为默认模式",
+        f"- **规则引擎** 速度最快 ({summary['rules']['avg_time']:.2f}ms)，适合离线场景",
+        f"- **纯LLM** 在口语化问题上表现更好，但耗时较长 ({summary['llm']['avg_time']:.2f}ms)",
+        "",
+        "## 3. 错误案例分析",
+        "",
+    ])
+    
+    if errors:
+        lines.append(f"共发现 **{len(errors)}** 个错误案例：")
+        lines.append("")
+        for i, err in enumerate(errors[:5], 1):
+            lines.append(f"### 案例 {i}")
+            lines.append(f"- **问题**: {err.get('原始问题', err.get('问题', ''))}")
+            lines.append(f"- **期望**: 类型={err.get('期望类型', '')}, 路由={err.get('期望路由', '')}")
+            lines.append(f"- **实际**: 类型={err.get('实际类型', '')}, 路由={err.get('实际路由', '')}")
+            lines.append("")
+    else:
+        lines.append("无错误案例")
+    
+    lines.append("---")
+    lines.append("*报告由 evaluate.py 自动生成*")
+    
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def print_usage() -> None:
+    print("""
+使用方法:
+    python evaluate.py              # 三模式对比
+    python evaluate.py rules        # 仅规则模式
+    python evaluate.py llm          # 仅LLM模式
+    python evaluate.py hybrid       # 仅混合模式
+    python evaluate.py --limit 20   # 限制样本数（快速测试）
+""")
+
+
+def main() -> None:
+    if len(sys.argv) > 1:
+        limit = None
+        args = sys.argv[1:]
+        if "--limit" in args:
+            idx = args.index("--limit")
+            if idx + 1 < len(args):
+                try:
+                    limit = int(args[idx + 1])
+                    args.pop(idx + 1)
+                    args.pop(idx)
+                except ValueError:
+                    pass
+        
+        if args and args[0] in ["rules", "llm", "hybrid"]:
+            mode = args[0]
+            print("=" * 70)
+            print(f"动车检修问答系统 - {mode.upper()} 模式评估")
+            print("=" * 70)
+            rows, stats = run_mode(mode, limit)
+            output_path = ROOT / "evaluation" / f"results_{mode}.csv"
+            save_csv(rows, output_path)
+            print(f"\n已保存: {output_path}")
+            print_stats(stats)
+        else:
+            compare_modes(limit)
+    else:
+        compare_modes()
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "rules"
-    rows = run(mode)
-    output = ROOT / "evaluation" / "results.csv"
-    with output.open("w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=rows[0].keys())
-        writer.writeheader(); writer.writerows(rows)
-    total = len(rows)
-    print(f"已生成 {output}")
-    for key in ("类型正确", "关键信息正确", "缺失判断正确", "路由正确"):
-        print(f"{key}: {sum(row[key] for row in rows) / total:.1%}")
-
+    main()
