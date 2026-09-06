@@ -5,10 +5,10 @@
 ## 快速启动
 
 ```powershell
-cd project
+cd QAsystem
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python main.py "轴箱有点响，应该怎么办？"
 streamlit run app.py
 ```
@@ -27,7 +27,15 @@ python -m pytest tests -q
 
 ## 可选 LLM 配置
 
-复制 `.env.example` 为 `.env`，填写 OpenAI-compatible API 的密钥、地址和模型名。无 `.env` 时，`llm` 和 `hybrid` 请求都会安全回退到规则模式。
+复制 `.env.example` 为 `.env`，填写 OpenAI-compatible API 的密钥、地址和模型名；`.env` 已被 Git 忽略，不能提交、截图或写入报告。无 `.env` 时，`llm` 和 `hybrid` 请求都会安全回退到规则模式。
+
+处理模式：
+
+- `rules`：只运行离线规则，适合基线评估。
+- `llm`：优先调用在线模型；调用失败自动回退规则模式。
+- `hybrid`：先运行规则；低置信度问题才调用在线模型，适合页面演示。
+
+常见问题：若提示“未配置 OPENAI_API_KEY”，请检查 `.env` 是否与 `main.py` 同级；若 API 超时或返回格式不合法，系统会重试一次后回退规则模式，并在输出的 `元数据` 中标记原因。
 
 ## 团队约定
 

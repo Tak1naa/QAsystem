@@ -9,11 +9,11 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main import analyze
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def normalized_terms(result: dict, field: str) -> set[str]:
