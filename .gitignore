@@ -4,5 +4,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+tmp/
 evaluation/results*.csv
 

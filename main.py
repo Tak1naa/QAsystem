@@ -27,12 +27,13 @@ def analyze(question: str, mode: Mode = "hybrid") -> dict:
         rules["元数据"]["source"] = "rules_high_confidence"
         return rules
 
+    llm_started = time.perf_counter()
     try:
-        llm_result, llm_elapsed = analyze_with_llm(question.strip())
+        llm_result, _ = analyze_with_llm(question.strip())
+        llm_result["运行耗时"]["规则耗时_ms"] = rules["运行耗时"]["规则耗时_ms"]
+        llm_result["运行耗时"]["总耗时_ms"] = round((time.perf_counter() - started) * 1000, 3)
         if mode == "hybrid":
             llm_result["处理模式"] = "hybrid"
-            llm_result["运行耗时"]["规则耗时_ms"] = rules["运行耗时"]["规则耗时_ms"]
-            llm_result["运行耗时"]["总耗时_ms"] = round((time.perf_counter() - started) * 1000, 2)
             llm_result["元数据"]["source"] = "rules_then_llm"
         return llm_result
     except RuntimeError as exc:
@@ -40,11 +41,25 @@ def analyze(question: str, mode: Mode = "hybrid") -> dict:
         rules["元数据"]["fallback_used"] = True
         rules["元数据"]["fallback_reason"] = str(exc)
         rules["元数据"]["source"] = "rules_fallback"
+        rules["运行耗时"]["大模型耗时_ms"] = round((time.perf_counter() - llm_started) * 1000, 3)
         rules["运行耗时"]["总耗时_ms"] = round((time.perf_counter() - started) * 1000, 2)
         return rules
 
 
 if __name__ == "__main__":
+    import argparse
     import json
-    import sys
-    print(json.dumps(analyze(" ".join(sys.argv[1:]) or "轴箱有点响，应该怎么办？"), ensure_ascii=False, indent=2))
+
+    parser = argparse.ArgumentParser(description="分析动车检修问题")
+    parser.add_argument("text", nargs="*", help="检修问题（也可用 --question）")
+    parser.add_argument("--question", help="检修问题")
+    parser.add_argument("--mode", choices=PROCESSING_MODES, default="hybrid")
+    args = parser.parse_args()
+    if args.question is not None and args.text:
+        parser.error("位置参数和 --question 只能选择一种")
+    question = args.question if args.question is not None else " ".join(args.text) or "轴箱有点响，应该怎么办？"
+    try:
+        result = analyze(question, args.mode)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(json.dumps(result, ensure_ascii=False, indent=2))

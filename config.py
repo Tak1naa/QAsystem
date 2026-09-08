@@ -23,6 +23,9 @@ QUESTION_TYPES = [
     "故障诊断问题",
     "工艺流程问题",
     "超限处置问题",
+    "条件判断问题",
+    "部件信息问题",
+    "概念解释问题",
     "非动车检修问题",
 ]
 ROUTE_LABELS = ["RAG", "KG", "CLARIFY", "OUT_OF_SCOPE"]

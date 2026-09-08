@@ -1,6 +1,7 @@
-# evaluate.py - 批量评估程序（100条样本，三模式对比）
+"""批量评估公共接口，记录预测、错误案例和实际运行来源。"""
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sys
@@ -35,7 +36,7 @@ def load_samples() -> list[dict]:
         return json.load(f)
 
 
-def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[list[dict], dict]:
+def run_mode(mode: str = "hybrid", sample_limit: int | None = None, samples: list[dict] | None = None) -> tuple[list[dict], dict]:
     """
     运行指定模式的评估
     
@@ -46,8 +47,10 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
     Returns:
         (rows, stats)
     """
-    samples = load_samples()
-    if sample_limit:
+    samples = load_samples() if samples is None else samples
+    if sample_limit is not None:
+        if sample_limit <= 0:
+            raise ValueError("样本数限制必须大于0")
         samples = samples[:sample_limit]
     
     rows = []
@@ -56,13 +59,13 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
     
     for idx, sample in enumerate(samples, 1):
         question = sample.get("原始问题", "")
-        if not question:
-            continue
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(f"样本{sample.get('id')}的原始问题为空")
         
         if idx % 20 == 0:
             print(f"   进度: {idx}/{len(samples)}")
         
-        start_time = time.time()
+        start_time = time.perf_counter()
         try:
             result = analyze(question, mode)
         except Exception as e:
@@ -71,14 +74,20 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
                 "id": sample.get("id", f"ERR_{idx}"),
                 "问题": question[:30] + "..." if len(question) > 30 else question,
                 "模式": mode,
+                "成功": False,
                 "类型正确": False,
                 "关键信息正确": False,
                 "缺失判断正确": False,
                 "路由正确": False,
-                "总耗时_ms": 0,
+                "总耗时_ms": round((time.perf_counter() - start_time) * 1000, 4),
+                "错误": f"{type(e).__name__}: {e}",
+                "实体标注完整": sample.get("实体标注完整", False),
+                "实体TP": 0,
+                "实体FP": 0,
+                "实体FN": sum(len(set(v)) for v in sample.get("关键信息", {}).values()),
                 "规则耗时_ms": 0,
                 "大模型耗时_ms": 0,
-                "fallback": True,
+                "fallback": False,
                 "原始问题": question,
                 "实际类型": "ERROR",
                 "期望类型": sample.get("问题类型", ""),
@@ -89,7 +98,7 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
             })
             continue
         
-        elapsed = (time.time() - start_time) * 1000
+        elapsed = (time.perf_counter() - start_time) * 1000
         
         expected = sample.get("关键信息", {})
         expected_type = sample.get("问题类型", "")
@@ -98,14 +107,11 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
         
         type_ok = result.get("问题类型", "") == expected_type
         
-        entity_ok = True
-        for field, values in expected.items():
-            if not values:
-                continue
-            norm_set = normalized_terms(result, field)
-            if not set(values).issubset(norm_set):
-                entity_ok = False
-                break
+        expected_entities = {(field, value) for field, values in expected.items() for value in values}
+        actual_entities = {(field, value) for field in result.get("标准化信息", {})
+                           for value in normalized_terms(result, field)}
+        full = sample.get("实体标注完整", False)
+        entity_ok = actual_entities == expected_entities if full else expected_entities <= actual_entities
         
         actual_missing = set(result.get("缺失信息", []))
         missing_ok = actual_missing == expected_missing
@@ -117,11 +123,22 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
             "id": sample.get("id", ""),
             "问题": question[:30] + "..." if len(question) > 30 else question,
             "模式": mode,
+            "成功": True,
+            "实际来源": result.get("元数据", {}).get("source", "unknown"),
+            "实际实体": result.get("标准化信息", {}),
+            "期望实体": expected,
+            "实体标注完整": full,
+            "实体TP": len(actual_entities & expected_entities),
+            "实体FP": len(actual_entities - expected_entities) if full else None,
+            "实体FN": len(expected_entities - actual_entities),
+            "漏提实体": sorted(expected_entities - actual_entities),
+            "多提实体": sorted(actual_entities - expected_entities) if full else None,
+            "澄清触发正确": bool(result.get("澄清提示", "").strip()) == bool(expected_missing),
             "类型正确": type_ok,
             "关键信息正确": entity_ok,
             "缺失判断正确": missing_ok,
             "路由正确": route_ok,
-            "总耗时_ms": round(elapsed, 2),
+            "总耗时_ms": round(elapsed, 4),
             "规则耗时_ms": result.get("运行耗时", {}).get("规则耗时_ms", 0),
             "大模型耗时_ms": result.get("运行耗时", {}).get("大模型耗时_ms", 0),
             "fallback": result.get("元数据", {}).get("fallback_used", False),
@@ -130,12 +147,13 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
             "期望类型": expected_type,
             "实际路由": actual_route,
             "期望路由": expected_route,
-            "实际缺失": "|".join(actual_missing),
-            "期望缺失": "|".join(expected_missing),
+            "实际缺失": "|".join(sorted(actual_missing)),
+            "期望缺失": "|".join(sorted(expected_missing)),
         })
     
     total = len(rows)
-    valid = [r for r in rows if r["总耗时_ms"] > 0]
+    # 成功与耗时无关：快速运行记录为0ms时也必须计入。
+    valid = [r for r in rows if r["成功"]]
     vc = len(valid) if valid else 1
     
     stats = {
@@ -148,7 +166,19 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None) -> tuple[lis
         "avg_time": sum(r["总耗时_ms"] for r in valid) / vc if valid else 0,
         "fallback_count": sum(r["fallback"] for r in rows),
     }
-    
+    fully_annotated = [r for r in rows if r.get("实体标注完整")]
+    stats["entity_micro"] = None
+    if fully_annotated:
+        tp = sum(r["实体TP"] for r in fully_annotated)
+        fp = sum(r["实体FP"] for r in fully_annotated)
+        fn = sum(r["实体FN"] for r in fully_annotated)
+        stats["entity_micro"] = {
+            "samples": len(fully_annotated), "tp": tp, "fp": fp, "fn": fn,
+            "precision": tp / (tp + fp) if tp + fp else 0,
+            "recall": tp / (tp + fn) if tp + fn else 0,
+            "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0,
+        }
+    stats["clarification_correct"] = sum(r.get("澄清触发正确", False) for r in rows)
     return rows, stats
 
 
@@ -159,24 +189,26 @@ def save_csv(rows: list[dict], output_path: Path) -> None:
     fieldnames = [
         "id", "问题", "模式", "类型正确", "关键信息正确",
         "缺失判断正确", "路由正确", "总耗时_ms", "规则耗时_ms",
-        "大模型耗时_ms", "fallback"
+        "大模型耗时_ms", "fallback", "成功", "实际来源", "实际类型", "期望类型",
+        "实际路由", "期望路由", "实际缺失", "期望缺失", "实际实体", "期望实体", "澄清触发正确",
+        "实体标注完整", "实体TP", "实体FP", "实体FN", "漏提实体", "多提实体", "错误"
     ]
     
     with output_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
+            writer.writerow({k: json.dumps(row.get(k), ensure_ascii=False) if isinstance(row.get(k), (dict, list)) else row.get(k, "") for k in fieldnames})
 
 
 def print_stats(stats: dict) -> None:
     """打印统计信息"""
-    total = stats["valid"]
+    total = stats["total"]
     if total == 0:
         print("   警告: 无有效结果")
         return
     
-    print(f"   有效样本: {total}/{stats['total']}")
+    print(f"   成功样本: {stats['valid']}/{total}")
     print(f"   类型识别准确率: {stats['type_correct']/total:.1%}")
     print(f"   关键信息提取准确率: {stats['entity_correct']/total:.1%}")
     print(f"   缺失判断准确率: {stats['missing_correct']/total:.1%}")
@@ -186,12 +218,14 @@ def print_stats(stats: dict) -> None:
         print(f"   降级次数: {stats['fallback_count']}")
 
 
-def compare_modes(sample_limit: int | None = None) -> None:
+def compare_modes(sample_limit: int | None = None, samples: list[dict] | None = None, output_dir: Path | None = None) -> dict:
     """三模式对比"""
+    output_dir = output_dir or ROOT / "evaluation"
+    output_dir.mkdir(parents=True, exist_ok=True)
     modes = ["rules", "llm", "hybrid"]
     mode_names = {
         "rules": "纯规则引擎",
-        "llm": "纯LLM (DeepSeek)",
+        "llm": "LLM优先（失败时规则回退）",
         "hybrid": "混合模式 (规则+LLM)"
     }
     
@@ -202,8 +236,10 @@ def compare_modes(sample_limit: int | None = None) -> None:
     print("动车检修问答系统 - 三模式批量评估")
     print("=" * 70)
     
-    samples = load_samples()
-    if sample_limit:
+    samples = load_samples() if samples is None else samples
+    if sample_limit is not None:
+        if sample_limit <= 0:
+            raise ValueError("样本数限制必须大于0")
         samples = samples[:sample_limit]
     print(f"\n加载样本: {len(samples)} 条")
     
@@ -219,11 +255,11 @@ def compare_modes(sample_limit: int | None = None) -> None:
         print(f"模式: {mode_names[mode]}")
         print("-" * 40)
         
-        rows, stats = run_mode(mode, sample_limit)
+        rows, stats = run_mode(mode, samples=samples)
         all_results[mode] = rows
         all_stats[mode] = stats
         
-        output_path = ROOT / "evaluation" / f"results_{mode}.csv"
+        output_path = output_dir / f"results_{mode}.csv"
         save_csv(rows, output_path)
         print(f"   已保存: {output_path}")
         print_stats(stats)
@@ -236,15 +272,15 @@ def compare_modes(sample_limit: int | None = None) -> None:
     print("-" * 76)
     
     metrics = [
-        ("类型识别准确率", "type_correct"),
-        ("关键信息提取准确率", "entity_correct"),
-        ("缺失判断准确率", "missing_correct"),
-        ("路由建议准确率", "route_correct"),
+        ("类型识别准确率", "type_acc"),
+        ("关键信息提取准确率", "entity_acc"),
+        ("缺失判断准确率", "missing_acc"),
+        ("路由建议准确率", "route_acc"),
     ]
     
     summary = {}
     for mode, stats in all_stats.items():
-        total = stats["valid"]
+        total = stats["total"]
         summary[mode] = {
             "total": total,
             "avg_time": stats["avg_time"],
@@ -253,6 +289,9 @@ def compare_modes(sample_limit: int | None = None) -> None:
             "missing_acc": stats["missing_correct"] / total if total else 0,
             "route_acc": stats["route_correct"] / total if total else 0,
             "fallback_count": stats.get("fallback_count", 0),
+            "successful": stats["valid"],
+            "entity_micro": stats["entity_micro"],
+            "clarification_acc": stats["clarification_correct"] / total if total else 0,
         }
     
     for label, key in metrics:
@@ -293,6 +332,7 @@ def compare_modes(sample_limit: int | None = None) -> None:
     report = {
         "sample_count": len(samples),
         "type_distribution": dict(type_dist),
+        "results": all_results,
         "summary": summary,
         "error_count": len(error_rows),
         "errors": [
@@ -314,18 +354,19 @@ def compare_modes(sample_limit: int | None = None) -> None:
         ]
     }
     
-    report_path = ROOT / "evaluation" / "comparison_report.json"
+    report_path = output_dir / "comparison_report.json"
     with report_path.open("w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(f"\n详细报告已保存: {report_path}")
     
-    md_path = ROOT / "evaluation" / "评估报告.md"
+    md_path = output_dir / "评估报告.md"
     generate_markdown(md_path, summary, modes, mode_names, error_rows)
     print(f"Markdown报告已保存: {md_path}")
     
     print("\n" + "=" * 70)
     print("评估完成")
     print("=" * 70)
+    return report
 
 
 def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dict, errors: list) -> None:
@@ -359,9 +400,11 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
         "",
         "## 2. 结论与建议",
         "",
-        f"- **混合模式** 综合表现最佳，推荐作为默认模式",
-        f"- **规则引擎** 速度最快 ({summary['rules']['avg_time']:.2f}ms)，适合离线场景",
-        f"- **纯LLM** 在口语化问题上表现更好，但耗时较长 ({summary['llm']['avg_time']:.2f}ms)",
+        "- 全部样本参与准确率统计，执行失败计为错误。",
+        f"- 规则模式本次平均耗时 {summary['rules']['avg_time']:.2f}ms。",
+        "- LLM与混合模式必须结合实际来源和回退次数解读；回退结果不能作为在线模型性能证据。",
+        "- 当前实体指标是预期实体覆盖率，不处罚额外提取项，不能称为实体精确率。",
+        f"- 回退次数：LLM {summary['llm']['fallback_count']}，混合 {summary['hybrid']['fallback_count']}。",
         "",
         "## 3. 错误案例分析",
         "",
@@ -386,45 +429,27 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
     md_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def print_usage() -> None:
-    print("""
-使用方法:
-    python evaluate.py              # 三模式对比
-    python evaluate.py rules        # 仅规则模式
-    python evaluate.py llm          # 仅LLM模式
-    python evaluate.py hybrid       # 仅混合模式
-    python evaluate.py --limit 20   # 限制样本数（快速测试）
-""")
-
-
 def main() -> None:
-    if len(sys.argv) > 1:
-        limit = None
-        args = sys.argv[1:]
-        if "--limit" in args:
-            idx = args.index("--limit")
-            if idx + 1 < len(args):
-                try:
-                    limit = int(args[idx + 1])
-                    args.pop(idx + 1)
-                    args.pop(idx)
-                except ValueError:
-                    pass
-        
-        if args and args[0] in ["rules", "llm", "hybrid"]:
-            mode = args[0]
-            print("=" * 70)
-            print(f"动车检修问答系统 - {mode.upper()} 模式评估")
-            print("=" * 70)
-            rows, stats = run_mode(mode, limit)
-            output_path = ROOT / "evaluation" / f"results_{mode}.csv"
-            save_csv(rows, output_path)
-            print(f"\n已保存: {output_path}")
-            print_stats(stats)
-        else:
-            compare_modes(limit)
-    else:
-        compare_modes()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", default="rules", choices=("rules", "llm", "hybrid", "all"))
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--samples", type=Path, default=ROOT / "data/questions.json")
+    parser.add_argument("--output", type=Path, default=ROOT / "evaluation/latest")
+    args = parser.parse_args()
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit 必须大于0")
+    samples = json.loads(args.samples.read_text(encoding="utf-8"))
+    if not isinstance(samples, list) or not samples:
+        parser.error("样本必须是非空数组")
+    if args.mode == "all":
+        compare_modes(args.limit, samples, args.output)
+        return
+    rows, stats = run_mode(args.mode, args.limit, samples)
+    save_csv(rows, args.output / f"results_{args.mode}.csv")
+    (args.output / "report.json").write_text(json.dumps({"stats": stats, "rows": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print_stats(stats)
+    if stats["entity_micro"]:
+        print("实体micro指标:", stats["entity_micro"])
 
 
 if __name__ == "__main__":

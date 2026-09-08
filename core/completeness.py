@@ -1,89 +1,52 @@
-"""
-信息完整性检查器 —— 判断问题提供的信息是否足够做出有效回答，
-并在信息不足时生成澄清提示。
-"""
+"""按查询目的判断信息是否足够构造检索，而非判断是否足够直接维修。"""
 from __future__ import annotations
-from typing import Any
 
-# ============================================================
-# 各类问题类型的必填字段
-# ============================================================
-REQUIREMENTS: dict[str, list[str]] = {
-    "标准限度问题": ["指标"],
-    "故障诊断问题": ["部件", "故障或现象"],
-    "工艺流程问题": ["工艺或部件"],
-    "超限处置问题": ["具体部件", "超限指标"],
-    "非动车检修问题": [],
-}
-
-# 必填字段 → entities 字典中的检查键（entities 是 {字段: [{...}]} 格式）
-_FIELD_TO_CHECK: dict[str, str] = {
-    "指标": "指标",
-    "部件": "部件",
-    "故障或现象": "故障或现象",
-    "工艺或部件": "工艺或部件",  # 由 check 函数特殊处理
-    "具体部件": "部件",
-    "超限指标": "指标",
-}
-
-# ============================================================
-# 澄清提示模板 —— 缺什么、怎么补
-# ============================================================
-CLARIFY_TEMPLATES: dict[str, str] = {
-    "指标": "请补充具体检测指标，例如：剩磁量、轮径、划伤深度、过盈量、扭矩、绝缘电阻等。",
-    "部件": "请补充具体部件名称，例如：轮对轴箱、轴箱弹簧、车轮、车轴、构架等。",
-    "故障或现象": "请描述具体的故障现象或异常表现，例如：异响、裂纹、磨损、腐蚀、发热等。",
-    "工艺或部件": "请说明涉及的检修工艺（如探伤、打磨、压装）或具体部件名称。",
-    "具体部件": "请补充具体的部件名称，例如：轮对轴箱、轴箱弹簧、车轮、车轴等。",
-    "超限指标": "请补充超限的具体指标，例如：剩磁量、轮径、划伤深度、过盈量等。",
+HINTS = {
+    "部件": "请说明具体部件，例如车轴、制动盘或空气弹簧。",
+    "故障或现象": "请描述异常表现，例如异响、裂纹、漏油或发热。",
+    "指标": "请说明检测指标，例如轮径、剩磁量或划伤深度。",
+    "数值": "请提供实际测量值。",
+    "单位": "请补充测量单位，例如mm、kN或MPa。",
+    "工艺或部件": "请说明要执行的工艺或检修的部件。",
 }
 
 
-def check(question_type: str, entities: dict[str, list[dict[str, str]]]) -> tuple[str, list[str], str]:
-    """
-    检查问题信息完整性。
-
-    Args:
-        question_type: 问题类型
-        entities: 标准化实体字典 {字段: [{原始词, 标准词}]}
-
-    Returns:
-        (完整性级别, 缺失字段列表, 澄清提示文本)
-        完整性级别: "完整" / "信息不足" / "非本领域问题"
-    """
-    # 非检修问题
+def check(question_type: str, entities: dict, question: str = "") -> tuple[str, list[str], str]:
     if question_type == "非动车检修问题":
         return "非本领域问题", [], ""
-
-    required = REQUIREMENTS.get(question_type, [])
-    if not required:
-        return "完整", [], ""
-
-    # 检查每个必填字段
-    missing: list[str] = []
-    for req_field in required:
-        check_key = _FIELD_TO_CHECK.get(req_field, req_field)
-        if check_key == "工艺或部件":
-            if not entities.get("工艺") and not entities.get("部件"):
-                missing.append(req_field)
-        else:
-            if not entities.get(check_key):
-                missing.append(req_field)
-
+    missing = []
+    has = lambda key: bool(entities.get(key))
+    if question_type == "标准限度问题":
+        # 部件更换条件也是合法规程查询，不凭空补出“更换周期”实体。
+        condition_query = any(word in question for word in ("什么时候", "何时", "多久"))
+        if not has("指标") and not (condition_query and has("部件")):
+            if not has("部件"):
+                missing.append("部件")
+            missing.append("指标")
+    elif question_type == "故障诊断问题":
+        if not has("部件"):
+            missing.append("部件")
+        if not has("故障或现象") and not ("故障" in question and "表现" in question):
+            missing.append("故障或现象")
+    elif question_type == "工艺流程问题":
+        if not has("部件") and not has("工艺"):
+            missing.append("工艺或部件")
+        elif not has("部件") and has("故障或现象"):
+            missing.append("部件")
+    elif question_type in ("超限处置问题", "条件判断问题"):
+        if not has("部件"):
+            missing.append("部件")
+        specific_fault = any(item["标准词"] != "超限" for item in entities.get("故障或现象", []))
+        if not has("指标") and not specific_fault:
+            missing.append("指标" if not has("部件") or has("故障或现象") else "故障或现象")
+        if question_type == "条件判断问题" and has("数值") and not has("单位"):
+            missing.append("单位")
+    elif question_type == "部件信息问题" and not has("部件"):
+        missing.append("部件")
     if not missing:
         return "完整", [], ""
-
-    # 生成澄清提示
-    hints = []
-    for field in missing:
-        template = CLARIFY_TEMPLATES.get(field, f"请补充{field}信息。")
-        hints.append(template)
-
-    prompt = f"以上问题信息不全，请补充{'、'.join(missing)}。" + " ".join(hints)
-    return "信息不足", missing, prompt
+    return "信息不足", missing, " ".join(HINTS[field] for field in missing)
 
 
-def missing_fields(question_type: str, entities: dict[str, list[dict[str, str]]]) -> list[str]:
-    """便捷函数：仅返回缺失字段列表。"""
-    _, missing, _ = check(question_type, entities)
-    return missing
+def missing_fields(question_type: str, entities: dict) -> list[str]:
+    return check(question_type, entities)[1]

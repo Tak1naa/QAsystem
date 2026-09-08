@@ -1,74 +1,66 @@
-"""
-关键信息提取器 —— 基于术语词典在问题文本中进行最长匹配。
-
-从自然语言问题中提取6类实体：
-  部件、故障或现象、工艺、指标、数值、单位
-"""
+"""词典最长匹配与数值提取；只提取原文明确出现的信息。"""
 from __future__ import annotations
 import re
-from typing import Any
+
+FIELDS = ("部件", "故障或现象", "工艺", "指标", "数值", "单位")
+SEMANTIC_FIELDS = FIELDS[:4]
+NUMBER = re.compile(r"(?<![\w.])[-+−]?\d+(?:\.\d+)?|(?<=[\u4e00-\u9fff<>=≤≥～~±])[-+−]?\d+(?:\.\d+)?")
 
 
-NUMERIC_PATTERN = re.compile(
-    r"(?<![\d.])(\d+(?:\.\d+)?)\s*(mm|毫米|μm|um|微米|MPa|兆帕|kPa|千帕|kN|千牛|mT|毫特|MΩ|兆欧|MQ|Ω|欧姆|"
-    r"g·m|g\*m|克米|N·m|N\*m|牛米|牛·米|℃|°C|摄氏度|\%|％|百分比|min|分钟|h|小时)",
-    re.I,
-)
+def extract(question: str, terms: dict) -> tuple[dict, dict]:
+    raw = {field: [] for field in FIELDS}
+    normalized = {field: [] for field in FIELDS}
+    excluded = [match.span() for match in re.finditer(r"(?:汽车|自行车)轮胎", question)]
 
-ENTITY_FIELDS = ["部件", "故障或现象", "工艺", "指标", "数值", "单位"]
-SEMANTIC_FIELDS = ["部件", "故障或现象", "工艺", "指标"]
+    def add(field: str, original: str, standard: str) -> None:
+        item = {"原始词": original, "标准词": standard}
+        if item not in normalized[field]:
+            raw[field].append(item.copy())
+            normalized[field].append(item)
 
-
-def extract(question: str, terms: dict[str, dict[str, list[str]]]) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]:
-    """
-    从问题文本中提取实体，返回 (原始匹配, 标准化结果)。
-
-    匹配策略：
-      - 语义字段（部件/故障/工艺/指标）：术语词典最长匹配，同类不重叠
-      - 数值/单位：正则提取
-
-    Args:
-        question: 用户原始问题文本
-        terms: 术语词典，结构为 {类别: {标准名: [别名列表]}}
-
-    Returns:
-        (raw_entities, normalized_entities) —— 格式均为 {字段: [{原始词, 标准词}]}
-    """
-    raw = {field: [] for field in ENTITY_FIELDS}
-    normalized = {field: [] for field in ENTITY_FIELDS}
-    occupied: list[tuple[str, int, int]] = []
-
-    # 语义字段：术语词典最长匹配
     for category in SEMANTIC_FIELDS:
-        pairs: list[tuple[str, str]] = []
-        for standard, aliases in terms.get(category, {}).items():
-            for alias in aliases:
-                if alias:
-                    pairs.append((alias, standard))
-        pairs.sort(key=lambda x: len(x[0]), reverse=True)
-
-        for alias, standard in pairs:
-            for match in re.finditer(re.escape(alias), question, flags=re.I):
-                overlaps = any(
-                    saved_category == category
-                    and not (match.end() <= start or match.start() >= end)
-                    for saved_category, start, end in occupied
-                )
-                if overlaps:
+        occupied = []
+        pairs = {(alias, standard) for standard, aliases in terms.get(category, {}).items()
+                 for alias in [standard, *aliases] if alias}
+        for alias, standard in sorted(pairs, key=lambda p: (-len(p[0]), p[0])):
+            # MT/UT等英文简称必须独立出现，避免命中型号中的片段。
+            pattern = re.escape(alias)
+            if alias.isascii() and alias.isalnum():
+                pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
+            for match in re.finditer(pattern, question, re.I):
+                if any(match.start() < end and match.end() > start for start, end in excluded):
                     continue
-                occupied.append((category, match.start(), match.end()))
-                raw[category].append({"原始词": match.group(), "标准词": standard})
-                normalized[category].append({"原始词": match.group(), "标准词": standard})
+                if alias == "MT" and match.group() != "MT":
+                    continue
+                if any(match.start() < end and match.end() > start for start, end in occupied):
+                    continue
+                occupied.append(match.span())
+                add(category, match.group(), standard)
 
-    # 数值/单位：正则提取
-    for number, unit in NUMERIC_PATTERN.findall(question):
-        raw["数值"].append({"原始词": number, "标准词": number})
-        normalized["数值"].append({"原始词": number, "标准词": number})
-        unit_std = next(
-            (key for key, aliases in terms.get("单位", {}).items() if unit in aliases),
-            unit,
-        )
-        raw["单位"].append({"原始词": unit, "标准词": unit_std})
-        normalized["单位"].append({"原始词": unit, "标准词": unit_std})
+    unit_pairs = sorted(
+        {(alias, standard) for standard, aliases in terms["单位"].items() for alias in [standard, *aliases]},
+        key=lambda p: (-len(p[0]), p[0]),
+    )
+    unit_spans = []
+    for alias, standard in unit_pairs:
+        pattern = re.escape(alias)
+        if alias.isascii():
+            pattern = r"(?<![A-Za-z])" + pattern + r"(?![A-Za-z])"
+        for match in re.finditer(pattern, question, re.I):
+            if any(match.start() < end and match.end() > start for start, end in unit_spans):
+                continue
+            # 磁粉探伤的缩写MT不是毫特单位；无数值的MT只作工艺实体。
+            if alias.lower() == "mt" and match.group() == "MT" and not re.search(r"\d\s*$", question[:match.start()]):
+                continue
+            unit_spans.append(match.span())
+            add("单位", match.group(), standard)
 
+    for match in NUMBER.finditer(question):
+        before, after = question[:match.start()], question[match.end():]
+        # 型号、螺栓规格、章节号和序号不作为测量值。
+        if re.search(r"[A-Za-z]\s*$", before) or re.match(r"\d|\.\d", after):
+            continue
+        if after.startswith(("号", "次", "条")):
+            continue
+        add("数值", match.group(), match.group().replace("−", "-"))
     return raw, normalized

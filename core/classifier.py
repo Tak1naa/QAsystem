@@ -1,155 +1,45 @@
-"""
-问题类型分类器 —— 基于关键词加权打分的规则分类。
-
-支持的5类问题（按TEAM_PROTOCOL约定）：
-  标准限度问题、故障诊断问题、工艺流程问题、超限处置问题、非动车检修问题
-"""
+"""根据问句意图和领域实体识别问题类型。"""
 from __future__ import annotations
-from typing import Any
+import re
 
-# ============================================================
-# 分类关键词库 —— 按问题类型分组，每组关键词按匹配权重排列
-# ============================================================
-TYPE_KEYWORDS: dict[str, list[str]] = {
-    "标准限度问题": [
-        # 疑问词（强信号）
-        "多少", "多大", "多厚", "多深", "多长",
-        # 标准/限度词
-        "不超过", "不大于", "不小于", "不低于", "不高于",
-        "标准", "限度", "限值", "上限", "下限",
-        "允许", "不许超过", "不许", "不得超过",
-        # 值域词
-        "范围", "公差", "最大值", "最小值", "正常值",
-        # 比较词（在问标准时常出现）
-        "小于", "大于", "不低于", "不超",
-    ],
-    "故障诊断问题": [
-        # 因果疑问
-        "什么原因", "怎么回事", "可能是哪", "可能是哪里的",
-        "可能是", "哪的问题", "哪里的问题",
-        "什么故障", "什么毛病", "是什么问题",
-        "是什么导致的", "什么引起的",
-        # 判断词
-        "要不要换", "需不需要", "要不要修",
-        # 动检相关
-        "出了问题", "有问题", "不对",
-    ],
-    "工艺流程问题": [
-        # 操作疑问词
-        "怎么操作", "如何操作", "怎么修", "怎么处理", "怎么做",
-        "怎么检", "怎么测", "怎么查", "怎么注", "怎么拆",
-        "怎么装", "怎么调", "怎么打磨", "怎么探",
-        # 流程/步骤词
-        "如何", "步骤", "流程", "方法", "怎样", "怎么样",
-        "操作步骤", "操作流程",
-        # 要求问法
-        "有什么要求", "要注意什么",
-    ],
-    "超限处置问题": [
-        # 核心超限词（分类优先级最高）
-        "超限", "超标", "超了", "超过", "过大", "太大",
-        "超出", "低于标准", "不满足", "不符合",
-        # 超限后续处理
-        "怎么办", "怎么处理", "如何处置",
-    ],
-}
-
-# ============================================================
-# 触发词 —— 绕过记分，直接判定
-# ============================================================
-OVER_LIMIT_TRIGGERS = {"超限", "超标", "超了", "超过", "过大", "太大", "超出", "低于标准"}
-
-PROCESS_TRIGGERS = {
-    "怎么操作", "如何操作", "怎么修", "怎么做", "怎么检", "怎么测", "怎么查",
-    "怎么装", "怎么拆", "怎么注", "怎么调", "怎么打磨", "怎么探",
-    "怎么进行", "怎么处理",
-    "步骤", "流程", "操作步骤", "操作流程", "有什么要求",
-}
-
-STANDARD_TRIGGERS = {
-    "多少", "多大", "多厚", "多深", "多长",
-    "不超过", "不大于", "不小于", "不低于", "不高于",
-    "标准", "限度", "限值", "上限", "下限", "范围",
-}
-
-# ============================================================
-# 澄清/兜底关键词
-# ============================================================
-# 明显非检修领域的词
-OUT_OF_SCOPE_STRONG = {"天气", "股票", "火锅", "餐厅", "电影", "旅游", "买车", "手机", "游戏", "彩票", "保险"}
+OUTSIDE = re.compile(r"天气|股票|火锅|餐厅|电影|旅游|手机|游戏|彩票|轮胎|跑多快")
+CAUSE = re.compile(r"什么原因|为何|为什么|怎么回事|哪里.*问题|哪.*问题|导致|引起|故障.*表现")
+LIMIT = re.compile(r"多少|多大|多厚|多深|多长|多久|什么时候|何时|标准|限度|限值|公差|范围|算正常")
+DISPOSAL = re.compile(r"怎么办|怎么处理|如何处置|能修|能用|还能|可以.*修|要不要换|需不需要换")
+OVER = re.compile(r"超限|超标|超了|超出|过大|太大|超过|不符合|不满足|数据不对")
+PROCESS = re.compile(r"怎么|如何|怎样|步骤|流程|顺序|要求|注意|方法|哪些尺寸")
+CONDITION = re.compile(r"(?:小于|大于|低于|高于|超过|[<>≤≥])\s*[+-]?\d")
+CONCEPT = re.compile(r"什么是|是什么意思|含义|定义")
+COMPONENT = re.compile(r"组成|包括哪些|哪些部件|什么作用|功能|用途")
 
 
-def classify(question: str, entities: dict[str, list[dict[str, str]]]) -> tuple[str, float]:
-    """
-    对用户问题进行类型识别。
-
-    Args:
-        question: 用户原始问题文本
-        entities: 标准化信息实体字典，用于判断是否包含领域术语
-
-    Returns:
-        (问题类型, 置信度) —— 置信度范围 0.0 ~ 1.0
-    """
-    # ---- Step 0: 明显非检修问题 ----
-    for kw in OUT_OF_SCOPE_STRONG:
-        if kw in question:
-            return "非动车检修问题", 0.90
-
-    # ---- Step 1: 检查是否包含任何领域实体 ----
-    has_domain = any(
-        entities.get(field)
-        for field in ("部件", "故障或现象", "工艺", "指标")
-    )
-
-    if not has_domain:
-        return "非动车检修问题", 0.85
-
-    # ---- Step 2: 触发词快速通道 ----
-    # 超限词优先级最高
-    if any(kw in question for kw in OVER_LIMIT_TRIGGERS):
-        return "超限处置问题", 0.88
-
-    # 工艺触发词
-    if any(kw in question for kw in PROCESS_TRIGGERS):
+def classify(question: str, entities: dict) -> tuple[str, float]:
+    has_domain = any(entities.get(k) for k in ("部件", "故障或现象", "工艺", "指标"))
+    if "轮胎" in question or "汽车" in question:
+        return "非动车检修问题", 0.94
+    if OUTSIDE.search(question) and not entities.get("部件"):
+        return "非动车检修问题", 0.94
+    if CONCEPT.search(question) and has_domain:
+        return "概念解释问题", 0.90
+    if COMPONENT.search(question) and entities.get("部件"):
+        return "部件信息问题", 0.88
+    if CAUSE.search(question) and has_domain:
+        return "故障诊断问题", 0.90
+    # “超过多少”是在问限度，不等于已经超限。
+    if LIMIT.search(question) and (has_domain or re.search(r"测|数值|数据|正常", question)):
+        return "标准限度问题", 0.90 if has_domain else 0.50
+    if OVER.search(question) or (DISPOSAL.search(question) and has_domain):
+        return "超限处置问题", 0.86 if has_domain else 0.50
+    if CONDITION.search(question) and has_domain:
+        return "条件判断问题", 0.85
+    if PROCESS.search(question) and has_domain:
         return "工艺流程问题", 0.85
-
-    # ---- Step 3: 关键词加权打分 ----
-    scores: dict[str, int] = {}
-    for qtype, keywords in TYPE_KEYWORDS.items():
-        if qtype == "超限处置问题":
-            continue  # 已在上面处理
-        hit = 0
-        for kw in keywords:
-            if kw in question:
-                hit += 1
-        if hit > 0:
-            scores[qtype] = hit
-
-    if not scores:
-        # 无关键词命中但包含领域实体 → 用实体信号兜底
-        has_process = bool(entities.get("工艺"))
-        has_fault = bool(entities.get("故障或现象"))
-        has_part = bool(entities.get("部件"))
-        has_indicator = bool(entities.get("指标"))
-
-        if has_process:
-            return "工艺流程问题", 0.70
-        if has_fault:
-            return "故障诊断问题", 0.65
-        if has_indicator and not has_fault:
-            return "标准限度问题", 0.62
-        if has_part:
-            return "故障诊断问题", 0.55
-        return "非动车检修问题", 0.85
-
-    # 最高分类型
-    best_type = max(scores, key=scores.get)
-    total = sum(scores.values())
-
-    # 置信度：最高分占比 + 基础偏移
-    confidence = min(0.95, round(scores[best_type] / total + 0.15, 2))
-
-    # 微调：如果既有工艺实体又命中了"怎么/如何"等词但没有工艺类型得分，
-    # 说明可能是工艺流程问题被漏判——但这个逻辑由触发词覆盖了
-
-    return best_type, confidence
+    if not has_domain:
+        return "非动车检修问题", 0.70
+    if entities.get("工艺"):
+        return "工艺流程问题", 0.62
+    if entities.get("故障或现象"):
+        return "故障诊断问题", 0.60
+    if entities.get("指标"):
+        return "标准限度问题", 0.55
+    return "故障诊断问题", 0.45
