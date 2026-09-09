@@ -62,4 +62,6 @@ if __name__ == "__main__":
         result = analyze(question, args.mode)
     except ValueError as exc:
         parser.error(str(exc))
+    except KeyboardInterrupt:
+        parser.exit(130, "\n已取消本次分析。等待响应时按 Ctrl+C 会中断请求。\n")
     print(json.dumps(result, ensure_ascii=False, indent=2))

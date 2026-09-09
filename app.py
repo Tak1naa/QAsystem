@@ -7,7 +7,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from config import OPENAI_API_KEY
+from config import DEEPSEEK_API_KEY
 from main import analyze
 
 st.set_page_config(page_title="动车检修 · 问题理解", page_icon="🚆", layout="wide")
@@ -50,7 +50,7 @@ def highlight(question: str, entities: dict) -> str:
         color = HIGHLIGHT_COLORS.get(category, "rgba(128,128,128,0.10)")
         tag = (
             f"<mark class='entity' style='background:{color};border-radius:2px;padding:1px 4px'>"
-            f"{html.escape(term)}"
+            f"{html.escape(question[start:end])}"
             f"<small> {category}</small></mark>"
         )
         escaped.append(tag)
@@ -68,7 +68,7 @@ with st.sidebar:
     mode = st.selectbox("处理模式", ["rules", "hybrid", "llm"],
                         format_func=lambda x: {"rules": "纯规则", "hybrid": "混合模式", "llm": "大模型优先"}[x])
     st.caption("混合模式在规则置信度不足时调用大模型。调用失败会保留规则结果。")
-    st.caption("在线接口：已配置" if OPENAI_API_KEY else "在线接口：未配置，使用离线规则即可演示")
+    st.caption("在线接口：已配置" if DEEPSEEK_API_KEY else "在线接口：未配置，使用离线规则即可演示")
     st.divider()
     st.subheader("示例问题")
     for question in [

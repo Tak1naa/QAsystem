@@ -1,0 +1,31 @@
+{
+  "method": "Streamlit AppTest; Python-side timing excludes browser paint",
+  "cases": [
+    {
+      "question": "轴箱有点响，可能是哪的问题？",
+      "route": "KG",
+      "response_ms": 6.449299999985669
+    },
+    {
+      "question": "剩磁量不大于多少？",
+      "route": "RAG",
+      "response_ms": 0.9330000002591987
+    },
+    {
+      "question": "这个超了怎么办？",
+      "route": "CLARIFY",
+      "response_ms": 1.0038000000349712
+    },
+    {
+      "question": "今天北京天气怎么样？",
+      "route": "OUT_OF_SCOPE",
+      "response_ms": 1.7293999999310472
+    },
+    {
+      "question": "若 < 5mm & \"车轮\" 怎么办？",
+      "route": "CLARIFY",
+      "response_ms": 1.181099999939761
+    }
+  ],
+  "empty_input_rejected": true
+}

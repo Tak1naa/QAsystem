@@ -2,19 +2,33 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import csv
 import json
 import sys
 import time
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main import analyze
+from config import DEEPSEEK_MODEL
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def prompt_covers_fields(prompt: str, fields: set[str]) -> bool:
+    aliases = {"故障或现象": ("异常", "故障", "现象"), "工艺或部件": ("工艺", "部件")}
+    return all(any(word in prompt for word in aliases.get(field, (field,))) for field in fields)
+
+
+def experiment_metadata(samples: list[dict]) -> dict:
+    content = json.dumps(samples, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return {"created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "samples_sha256": hashlib.sha256(content).hexdigest(), "model": DEEPSEEK_MODEL,
+            "method": "LLM负责分类和实体提取，完整性及路由共用规则；回退不算在线成功"}
 
 
 def normalized_terms(result: dict, field: str) -> set[str]:
@@ -118,6 +132,8 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None, samples: lis
         
         actual_route = result.get("处理建议", {}).get("标签", "")
         route_ok = actual_route == expected_route
+        expected_complete = "非本领域问题" if expected_route == "OUT_OF_SCOPE" else "信息不足" if expected_missing else "完整"
+        prompt = result.get("澄清提示", "").strip()
         
         rows.append({
             "id": sample.get("id", ""),
@@ -134,6 +150,11 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None, samples: lis
             "漏提实体": sorted(expected_entities - actual_entities),
             "多提实体": sorted(actual_entities - expected_entities) if full else None,
             "澄清触发正确": bool(result.get("澄清提示", "").strip()) == bool(expected_missing),
+            "完整性正确": result.get("信息完整性") == expected_complete,
+            "实际完整性": result.get("信息完整性"),
+            "期望完整性": expected_complete,
+            "实际澄清提示": prompt,
+            "澄清字段覆盖正确": (bool(prompt) and prompt_covers_fields(prompt, expected_missing)) if expected_missing else not prompt,
             "类型正确": type_ok,
             "关键信息正确": entity_ok,
             "缺失判断正确": missing_ok,
@@ -179,6 +200,11 @@ def run_mode(mode: str = "hybrid", sample_limit: int | None = None, samples: lis
             "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0,
         }
     stats["clarification_correct"] = sum(r.get("澄清触发正确", False) for r in rows)
+    stats["completeness_correct"] = sum(r.get("完整性正确", False) for r in rows)
+    stats["prompt_coverage_correct"] = sum(r.get("澄清字段覆盖正确", False) for r in rows)
+    stats["source_counts"] = dict(Counter(r.get("实际来源", "error") for r in rows))
+    stats["confusion_matrix"] = {label: dict(Counter(r["实际类型"] for r in rows if r["期望类型"] == label))
+                                 for label in sorted({r["期望类型"] for r in rows})}
     return rows, stats
 
 
@@ -191,7 +217,8 @@ def save_csv(rows: list[dict], output_path: Path) -> None:
         "缺失判断正确", "路由正确", "总耗时_ms", "规则耗时_ms",
         "大模型耗时_ms", "fallback", "成功", "实际来源", "实际类型", "期望类型",
         "实际路由", "期望路由", "实际缺失", "期望缺失", "实际实体", "期望实体", "澄清触发正确",
-        "实体标注完整", "实体TP", "实体FP", "实体FN", "漏提实体", "多提实体", "错误"
+        "实体标注完整", "实体TP", "实体FP", "实体FN", "漏提实体", "多提实体", "错误",
+        "完整性正确", "实际完整性", "期望完整性", "实际澄清提示", "澄清字段覆盖正确"
     ]
     
     with output_path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -261,6 +288,8 @@ def compare_modes(sample_limit: int | None = None, samples: list[dict] | None = 
         
         output_path = output_dir / f"results_{mode}.csv"
         save_csv(rows, output_path)
+        (output_dir / f"report_{mode}.json").write_text(json.dumps(
+            {"metadata": experiment_metadata(samples), "stats": stats, "rows": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"   已保存: {output_path}")
         print_stats(stats)
     
@@ -292,6 +321,9 @@ def compare_modes(sample_limit: int | None = None, samples: list[dict] | None = 
             "successful": stats["valid"],
             "entity_micro": stats["entity_micro"],
             "clarification_acc": stats["clarification_correct"] / total if total else 0,
+            "completeness_acc": stats["completeness_correct"] / total if total else 0,
+            "prompt_coverage_acc": stats["prompt_coverage_correct"] / total if total else 0,
+            "source_counts": stats["source_counts"],
         }
     
     for label, key in metrics:
@@ -305,13 +337,13 @@ def compare_modes(sample_limit: int | None = None, samples: list[dict] | None = 
     print(f"{'降级次数':<22} {fallbacks[0]:<18} {fallbacks[1]:<18} {fallbacks[2]:<18}")
     
     print("\n" + "=" * 70)
-    print("错误案例分析（混合模式）")
+    print("错误案例分析（全部模式）")
     print("=" * 70)
     
-    hybrid_rows = all_results.get("hybrid", [])
+    combined_rows = [row for rows in all_results.values() for row in rows]
     error_rows = [
-        r for r in hybrid_rows
-        if not all([r["类型正确"], r["关键信息正确"], r["缺失判断正确"], r["路由正确"]])
+        r for r in combined_rows
+        if not all(r.get(key, False) for key in ("类型正确", "关键信息正确", "缺失判断正确", "路由正确", "完整性正确", "澄清字段覆盖正确"))
     ]
     
     if error_rows:
@@ -327,9 +359,10 @@ def compare_modes(sample_limit: int | None = None, samples: list[dict] | None = 
             if not err["路由正确"]: error_items.append("路由建议")
             print(f"   错误项: {' -> '.join(error_items)}")
     else:
-        print("\n混合模式下无错误案例")
+        print("\n本次各模式下无错误案例")
     
     report = {
+        "metadata": experiment_metadata(samples),
         "sample_count": len(samples),
         "type_distribution": dict(type_dist),
         "results": all_results,
@@ -378,7 +411,7 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
         "",
         "## 1. 三模式对比",
         "",
-        "| 指标 | 规则引擎 | 纯LLM | 混合模式 |",
+        "| 指标 | 规则引擎 | LLM辅助理解＋共用完整性规则 | 混合模式 |",
         "|------|----------|-------|----------|",
     ]
     
@@ -387,6 +420,9 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
         ("关键信息提取准确率", "entity_acc"),
         ("缺失判断准确率", "missing_acc"),
         ("路由建议准确率", "route_acc"),
+        ("完整性准确率", "completeness_acc"),
+        ("澄清触发准确率", "clarification_acc"),
+        ("澄清字段覆盖率", "prompt_coverage_acc"),
     ]
     
     for label, key in metrics:
@@ -403,7 +439,8 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
         "- 全部样本参与准确率统计，执行失败计为错误。",
         f"- 规则模式本次平均耗时 {summary['rules']['avg_time']:.2f}ms。",
         "- LLM与混合模式必须结合实际来源和回退次数解读；回退结果不能作为在线模型性能证据。",
-        "- 当前实体指标是预期实体覆盖率，不处罚额外提取项，不能称为实体精确率。",
+        "- 部分标注题仅检查预期实体覆盖；完整标注题检查实体集合完全匹配，并在JSON中给出micro P/R/F1。",
+        "- 澄清字段覆盖率只检查提示是否提到缺失字段，不代表人工评判的语句合理性；逐题提示保存在结果表中供复核。",
         f"- 回退次数：LLM {summary['llm']['fallback_count']}，混合 {summary['hybrid']['fallback_count']}。",
         "",
         "## 3. 错误案例分析",
@@ -415,7 +452,7 @@ def generate_markdown(md_path: Path, summary: dict, modes: list, mode_names: dic
         lines.append("")
         for i, err in enumerate(errors[:5], 1):
             lines.append(f"### 案例 {i}")
-            lines.append(f"- **问题**: {err.get('原始问题', err.get('问题', ''))}")
+            lines.append(f"- **模式 / 问题**: {err.get('模式')} / {err.get('原始问题', err.get('问题', ''))}")
             lines.append(f"- **期望**: 类型={err.get('期望类型', '')}, 路由={err.get('期望路由', '')}")
             lines.append(f"- **实际**: 类型={err.get('实际类型', '')}, 路由={err.get('实际路由', '')}")
             lines.append("")
@@ -446,7 +483,7 @@ def main() -> None:
         return
     rows, stats = run_mode(args.mode, args.limit, samples)
     save_csv(rows, args.output / f"results_{args.mode}.csv")
-    (args.output / "report.json").write_text(json.dumps({"stats": stats, "rows": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (args.output / "report.json").write_text(json.dumps({"metadata": experiment_metadata(samples[:args.limit]), "stats": stats, "rows": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
     print_stats(stats)
     if stats["entity_micro"]:
         print("实体micro指标:", stats["entity_micro"])
