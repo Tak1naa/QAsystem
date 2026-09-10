@@ -1,9 +1,25 @@
+# Local credentials and environments
 .env
+.env.*
+!.env.example
 .venv/
+venv/
 .claude/
+
+# Reproducible caches and temporary files
 __pycache__/
 *.py[cod]
 .pytest_cache/
 tmp/
-evaluation/results*.csv
+output/
+~$*
+.DS_Store
+Thumbs.db
 
+# Ad-hoc evaluation runs (fixed historical evidence is tracked explicitly)
+evaluation/results*.csv
+evaluation/latest/
+evaluation/latest_regression/
+evaluation/local_*/
+evaluation/presentation_check/
+evaluation/online_run/
